@@ -207,6 +207,92 @@ def parse_wise_text(text):
     return all_page_txns
 
 
+def parse_monzo_text(text):
+    """
+    Monzo-specific parser. Monzo PDFs use:
+    - DD/MM/YYYY date format on every transaction line
+    - Description: merchant + location + country code
+    - Amount (can be negative, no £ symbol)
+    - Balance (positive, comma-separated thousands)
+    
+    Output: Date | Description | Type | Money In | Money Out | Balance
+    """
+    import re
+    transactions = []
+    month_abbr = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+
+    # Monzo date format: DD/MM/YYYY at start of each transaction line
+    monzo_pat = re.compile(
+        rf'^(\d{{1,2}}/\d{{1,2}}/\d{{4}})\s+(.+?)\s+(-?[\d,]+\.?\d*)\s+(-?[\d,]+\.?\d*)$'
+    )
+
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+
+        m = re.match(monzo_pat, line)
+        if not m:
+            continue
+
+        raw_date = m.group(1)  # DD/MM/YYYY
+        desc = m.group(2).strip()
+        amount = float(m.group(3).replace(',', ''))
+        balance = float(m.group(4).replace(',', ''))
+
+        # Parse DD/MM/YYYY
+        parts = raw_date.split('/')
+        day = int(parts[0])
+        month = int(parts[1])
+        year = int(parts[2])
+        date_str = f"{day} {month_abbr[month-1]} {year}"
+
+        # Classify type
+        upper = desc.upper()
+        if 'TRANSFER FROM POT' in upper or 'TRANSFER TO POT' in upper:
+            tx_type = 'Transfer'
+        elif 'BANK TRANSFER' in upper or 'FASTER PAYMENT' in upper:
+            tx_type = 'Bank Transfer'
+        elif 'DIRECT DEBIT' in upper:
+            tx_type = 'Direct Debit'
+        elif 'DEBIT CARD' in upper or 'CARD' in upper or 'PENDING' in upper or 'UBR' in upper:
+            tx_type = 'Debit Card'
+        elif 'FEE' in upper or 'CHARGE' in upper:
+            tx_type = 'Fee'
+        elif 'CREDIT' in upper or 'DEPOSIT' in upper:
+            tx_type = 'Credit'
+        elif amount >= 0:
+            tx_type = 'Credit'
+        else:
+            tx_type = 'Payment'
+
+        # Money in/out
+        if amount >= 0:
+            money_in = round(amount, 2)
+            money_out = ''
+        else:
+            money_in = ''
+            money_out = round(abs(amount), 2)
+
+        transactions.append({
+            'date': date_str,
+            'description': desc,
+            'type': tx_type,
+            'money_in': money_in,
+            'money_out': money_out,
+            'balance': round(balance, 2),
+            'raw_amount': amount,
+            'sort_key': (year, month, day)
+        })
+
+    # Sort chronologically (oldest first)
+    transactions.sort(key=lambda t: t['sort_key'])
+    for tx in transactions:
+        tx.pop('sort_key', None)
+
+    return transactions
+
+
 def parse_bank_text(text):
     """
     Smart text parser for line-based bank statements (NatWest, Lloyds, Tide, etc.)
@@ -406,9 +492,12 @@ def extract_tables_from_pdf(pdf_path):
 
     # Detect Wise format (Wise Payments Ltd. header + transaction lines without DD Mon on TX line)
     is_wise = 'Wise Payments' in all_text or 'wise.com' in all_text.lower()
+    is_monzo = 'Monzo' in all_text or 'Account number: 6865' in all_text
 
     if is_wise:
         txns = parse_wise_text(all_text)
+    elif is_monzo:
+        txns = parse_monzo_text(all_text)
     else:
         txns = parse_bank_text(all_text)
 
