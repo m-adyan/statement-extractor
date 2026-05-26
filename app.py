@@ -1158,6 +1158,10 @@ TEMPLATE = """
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok'})
+
 @app.route('/')
 def index():
     return render_template_string(TEMPLATE)
@@ -1176,6 +1180,9 @@ def extract():
     try:
         tables = extract_tables_from_pdf(tmp_path)
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"PDF extract error: {e}\n{tb}")
         return jsonify({'error': f'Failed to read PDF: {str(e)}'}), 500
     
     if not tables:
