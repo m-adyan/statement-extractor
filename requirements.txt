@@ -1,0 +1,4 @@
+flask>=2.0
+pdfplumber>=0.10.0
+openpyxl>=3.0.0
+gunicorn>=20.0
