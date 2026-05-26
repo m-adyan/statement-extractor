@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: statement-extractor
-    runtime: python3
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --host 0.0.0.0 --port $PORT
-    envVars:
-      - key: MAX_CONTENT_LENGTH
-        value: 52428800
