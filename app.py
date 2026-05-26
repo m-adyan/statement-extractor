@@ -16,7 +16,8 @@ from openpyxl.utils import get_column_letter
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
-app.config['UPLOAD_FOLDER'] = tempfile.mkdtemp()
+app.config['UPLOAD_FOLDER'] = '/tmp/statement-extractor'
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
