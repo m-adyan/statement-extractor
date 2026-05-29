@@ -293,51 +293,52 @@ def parse_monzo_text(text):
 
     return transactions
 
-
 def parse_bank_text(text):
     """
     Smart text parser for line-based bank statements (NatWest, Lloyds, Tide, etc.)
-    Detects transaction lines and returns structured data with Date, Description, Type,
-    Money In, Money Out, Balance.
-
-    Auto-detects year from statement header and applies to all date-only transaction lines.
-    Handles year boundaries (Dec → Jan) correctly via chronological ordering.
+    Detects transaction lines and returns structured data with Date, Description,
+    Type, Money In, Money Out, Balance.
+    Handles two-line format: date+description on line 1, amount+balance on line 2.
     """
     import re
     transactions = []
     months = 'Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec'
     month_idx = {m: i+1 for i, m in enumerate(['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'])}
 
-    # ── 1. Detect year from statement header ──────────────────────────────────
-    # Patterns: "15/01/2026" | "15 Jan 2026" | "Statement for: 1 Apr 2025 - 30 Apr 2025"
+    # -- 1. Detect year from statement header ----------------------------------
     detected_year = None
     for header_line in text.split('\n')[:30]:
-        # Skip auto-generated metadata
         if re.match(r'^(Generated|Created|Printed|Updated)\s+on:', header_line, re.IGNORECASE):
             continue
-        # Period range line: "31 August 2023 - 31 August 2024"
-        if re.search(rf'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}).*? - .*?(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})', header_line):
-            m = re.search(rf'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4}))', header_line)
-            if m:
-                detected_year = int(m.group(2))
+        m = re.search(rf'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}).*? - .*?(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})', header_line)
+        if m:
+            ym = re.search(r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4}))', m.group(1))
+            if ym:
+                detected_year = int(ym.group(2))
                 break
         hm = re.search(r'(\d{2})/(\d{2})/(\d{4})', header_line)
         if hm:
             detected_year = int(hm.group(3))
             break
-        hm2 = re.search(rf'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{{4}})', header_line)
+        hm2 = re.search(rf'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})', header_line)
         if hm2:
             detected_year = int(hm2.group(0).split()[1])
             break
 
-    # ── 2. Regex patterns ─────────────────────────────────────────────────────
-    # NatWest: amount ends with £SIGN (negative = debit, positive = credit)
-    natwest_pat = rf'^(\d{{1,2}}\s+({months})(?:,?\s+\d{{4}})?)\s+(.+?)\s+(-?£[\d,]+\.?\d*)$'
-    # Tide/Wise: two plain numbers at end: AMOUNT BALANCE (no £ prefix)
-    tide_pat = rf'^(\d{{1,2}}\s+({months})(?:\s+\d{{4}})?)\s+(.+?)\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)$'
+    # -- 2. Regex patterns ------------------------------------------------------
+    # Date line: "DD Mon [YYYY] DESCRIPTION_WITHOUT_AMOUNTS"
+    date_line_pat = re.compile(rf'^(\d{{1,2}}\s+({months})(?:\s+\d{{4}})?)\s+(.+)$', re.IGNORECASE)
+    # Continuation: DESCRIPTION  AMOUNT  BALANCE  (last two numbers are amount+balance)
+    amount_pat = re.compile(r'^(.+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s*$')
+    # Same with optional £ prefix on amount
+    amount_pat2 = re.compile(r'^(.+?)\s+(-?£?[\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s*$')
+    # Single-amount line: "DESCRIPTION  BALANCE" (BROUGHT FORWARD, STATEMENT CLOSING)
+    single_amt_pat = re.compile(r'^(.+?)\s+([\d,]+\.\d{2})\s*$')
 
     prev_balance = None
-    curr_year = detected_year  # tracks working year as we go chronologically
+    curr_year = detected_year
+    pending_date = None
+    pending_desc = None
 
     for line in text.split('\n'):
         line = line.strip()
@@ -346,62 +347,115 @@ def parse_bank_text(text):
 
         amount = None
         balance = None
+        desc = None
+        raw_date = None
 
-        # Try NatWest format
-        m = re.match(natwest_pat, line)
-        if m:
-            raw_date = m.group(1)
-            desc = (m.group(3) or '').strip()
-            amt_raw = m.group(4)
-            negative = amt_raw.startswith('-')
-            try:
-                amt_val = float(amt_raw.replace('-', '').replace('£', '').replace(',', ''))
-                amount = -amt_val if negative else amt_val
-            except ValueError:
-                continue
-        else:
-            # Try Tide/Wise format
-            mt = re.match(tide_pat, line)
-            if not mt:
-                continue
-            raw_date = mt.group(1)
-            desc = mt.group(3).strip()
-            try:
-                amount = float(mt.group(4).replace(',', ''))
-                balance = float(mt.group(5).replace(',', ''))
-            except ValueError:
-                continue
+        # -- Try: Date line -------------------------------------------------------
+        dm = date_line_pat.match(line)
+        if dm:
+            raw_date = dm.group(1)
+            desc_candidate = dm.group(3).strip()
 
-        # ── 3. Parse month & day, track year across pages ─────────────────────
+            # Does the desc area have TWO amounts? (single-line: DESC £AMT BALANCE)
+            am = amount_pat.match(desc_candidate)
+            am2 = amount_pat2.match(desc_candidate)
+            if am:
+                desc = am.group(1).strip()
+                amount = float(am.group(2).replace(',',''))
+                balance = float(am.group(3).replace(',',''))
+                pending_date = None
+                pending_desc = None
+            elif am2:
+                desc = am2.group(1).strip()
+                raw_a = am2.group(2).replace('£','').replace(',','')
+                amount = float(raw_a)
+                balance = float(am2.group(3).replace(',',''))
+                pending_date = None
+                pending_desc = None
+            else:
+                # Does the desc area have ONE amount? (BROUGHT FORWARD pattern)
+                sam = single_amt_pat.match(desc_candidate)
+                if sam:
+                    desc = sam.group(1).strip()
+                    balance = float(sam.group(2).replace(',',''))
+                    amount = 0  # opening balance has no "movement"
+                    pending_date = None
+                    pending_desc = None
+                else:
+                    # No amounts on this line — save date+desc, wait for CONT line
+                    pending_date = raw_date
+                    pending_desc = desc_candidate
+                    continue
+
+        # -- Try: Continuation line (has amount+balance, no date) ---------------
+        if amount is None:
+            am = amount_pat.match(line)
+            if am:
+                desc = (am.group(1) or '').strip()
+                amount = float(am.group(2).replace(',',''))
+                balance = float(am.group(3).replace(',',''))
+                if pending_date:
+                    raw_date = pending_date
+                    desc = pending_desc or desc
+                    pending_date = None
+                    pending_desc = None
+                else:
+                    inline = re.search(r'(\d{2}/\d{2}/\d{2})', line)
+                    if inline:
+                        parts = inline.group(1).split('/')
+                        raw_date = "{} {} 20{}".format(parts[0], months.split('|')[int(parts[1])-1], parts[2])
+                    else:
+                        continue
+            else:
+                am2 = amount_pat2.match(line)
+                if am2:
+                    desc = (am2.group(1) or '').strip()
+                    raw_a = am2.group(2).replace('£','').replace(',','')
+                    amount = float(raw_a)
+                    balance = float(am2.group(3).replace(',',''))
+                    if pending_date:
+                        raw_date = pending_date
+                        desc = pending_desc or desc
+                        pending_date = None
+                        pending_desc = None
+                    else:
+                        inline = re.search(r'(\d{2}/\d{2}/\d{2})', line)
+                        if inline:
+                            parts = inline.group(1).split('/')
+                            raw_date = "{} {} 20{}".format(parts[0], months.split('|')[int(parts[1])-1], parts[2])
+                        else:
+                            continue
+
+        if amount is None or raw_date is None:
+            continue
+
+        # -- 3. Parse month & day, track year ------------------------------------
         date_parts = raw_date.replace(',', '').strip().split()
         if len(date_parts) < 2:
             continue
         day = date_parts[0]
         month_str = date_parts[1]
-        inline_year = None
-        if len(date_parts) >= 3:
-            inline_year = int(date_parts[2])
+        inline_year = int(date_parts[2]) if len(date_parts) >= 3 else None
 
         tx_month_idx = month_idx.get(month_str.title(), 1)
 
-        # Determine working year: use inline year if present, otherwise running year
         if inline_year:
-            # Inline year overrides working year (can jump forward/backward per page)
             curr_year = inline_year
         elif curr_year is None:
-            curr_year = 2026  # fallback
+            curr_year = 2026
 
-        # Apply year to get full date string (preserve original "DD Mon" display)
-        date_str = f"{day} {month_str.title()} {curr_year}"
+        date_str = "{} {} {}".format(day, month_str.title(), curr_year)
 
-        # ── 4. Classify transaction type ───────────────────────────────────────
-        upper = desc.upper()
-        if 'CREDIT' in upper or 'REFUND' in upper:
+        # -- 4. Classify transaction type -----------------------------------------
+        upper = (desc or '').upper()
+        if 'CREDIT' in upper or 'REFUND' in upper or 'BROUGHT FORWARD' in upper:
             tx_type = 'Credit'
         elif 'DEBIT CARD' in upper:
             tx_type = 'Debit Card'
-        elif 'DIRECT DEBIT' in upper:
+        elif 'DIRECT DEBIT' in upper or (' DD ' in upper) or upper.endswith(' DD'):
             tx_type = 'Direct Debit'
+        elif 'FASTER PAYMENT' in upper or ' FP ' in upper or 'FPI' in upper:
+            tx_type = 'Faster Payment'
         elif 'CHAPS' in upper or 'BACS' in upper:
             tx_type = 'Bank Transfer'
         elif 'STANDING ORDER' in upper:
@@ -411,10 +465,10 @@ def parse_bank_text(text):
         else:
             tx_type = 'Payment'
 
-        # ── 5. Money In / Money Out ─────────────────────────────────────────────
+        # -- 5. Money In / Money Out ---------------------------------------------
         if balance is not None and prev_balance is not None:
-            balance_diff = balance - prev_balance
-            if balance_diff >= 0:
+            diff = balance - prev_balance
+            if diff >= 0:
                 money_in = round(amount, 2) if amount > 0 else ''
                 money_out = ''
             else:
@@ -438,7 +492,7 @@ def parse_bank_text(text):
             'date': date_str,
             'month_idx': tx_month_idx,
             'day': int(day),
-            'description': desc,
+            'description': desc or '',
             'type': tx_type,
             'money_in': money_in,
             'money_out': money_out,
@@ -446,34 +500,263 @@ def parse_bank_text(text):
             'raw_amount': amount
         })
 
-    # ── 6. Fix year rollovers ──────────────────────────────────────────────────
-    # Statement is newest-first (descending). A year boundary only exists when
-    # we cross from December (12) into January (1) — NOT for normal May→Apr→Mar drops.
-    # Only the transactions OLDER than the Dec→Jan boundary get their year bumped.
+    # -- 6. Fix year rollovers -------------------------------------------------
     if len(transactions) >= 2:
         boundary_idx = None
         for i in range(1, len(transactions)):
             prev_mi = transactions[i-1]['month_idx']
             curr_mi = transactions[i]['month_idx']
-            # True year boundary: Dec(12) → Jan(1)
             if curr_mi == 1 and prev_mi == 12:
                 boundary_idx = i
                 break
         if boundary_idx:
             for tx in transactions[boundary_idx:]:
                 parts = tx['date'].split()
-                tx['date'] = f"{parts[0]} {parts[1]} {int(parts[2]) + 1}"
+                tx['date'] = "{} {} {}".format(parts[0], parts[1], int(parts[2]) + 1)
 
-    # Sort ascending (Jan 1 → Dec 31) for clean chronological output
+    # Sort ascending
     transactions.sort(key=lambda t: (t['month_idx'], t['day']))
 
-    # Strip auxiliary sort keys from final output
     for tx in transactions:
         tx.pop('month_idx', None)
         tx.pop('day', None)
 
     return transactions
 
+def parse_natwest_format3(pdf_path):
+    """
+    NatWest Format 3 — single-line "DD Mon DESCRIPTION TYPE £AMOUNT" text parser.
+    Each transaction on one line: date + description (may include type) + signed amount.
+    Amount signed: -£1,234.56 = money out, £1,234.56 = money in.
+    Year detected from statement period header — uses END year of the period
+    (e.g. "20/10/2025 to 10/02/2026" → end year = 2026).
+    Transactions are newest-first in PDF; year decrements when going from Jan back to Dec.
+    Sort: newest first (year DESC, month DESC, day DESC).
+    """
+    import re
+    import pdfplumber
+
+    months_list = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    month_idx = {m: i+1 for i, m in enumerate(months_list)}
+
+    with pdfplumber.open(pdf_path) as pdf:
+        all_text = '\n'.join(p.extract_text() or '' for p in pdf.pages)
+
+    # Detect year from statement period header "DD/MM/YYYY to DD/MM/YYYY" or "DD/MM/YYYY DD/MM/YYYY"
+    # Use the END year (second date) as starting year for transaction tracking
+    detected_year = None
+    period_match = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})\s+(?:to\s+)?(\d{1,2})/(\d{1,2})/(\d{4})', all_text)
+    if period_match:
+        detected_year = int(period_match.group(6))  # END year, not start year
+
+    date_pat = re.compile(
+        rf'^(\d{{1,2}})\s+({"|".join(months_list)})\s+\S+\s+\S+.*?\s+(-?£[\d,]+\.\d{{2}})\s*$',
+        re.IGNORECASE
+    )
+
+    type_keywords = [
+        'Debit Card Transaction', 'Mobile/Online Transaction',
+        'Direct Debit', 'ATM Transaction', 'Automated Credit',
+        'Standing Order', 'Bank Transfer', 'Faster Payment',
+        'Mobile/Online', 'Debit Card',
+        'Charges', 'Cash', 'Credits', 'Refund'
+    ]
+
+    transactions = []
+    curr_year = detected_year
+    prev_month_i = None
+
+    for line in all_text.split('\n'):
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+
+        dm = date_pat.match(line_stripped)
+        if not dm:
+            continue
+
+        day = int(dm.group(1))
+        month_str = dm.group(2).title()
+        amount_str = dm.group(3)
+
+        month_i = month_idx.get(month_str, 1)
+
+        # Year rollover: newest-first (Jan 30, then Jan 29, ... Dec 31, ... Oct 20).
+        # When month increases going backward in time (Jan=1 → Dec=12), we've crossed
+        # into the previous year.
+        if prev_month_i is not None and month_i > prev_month_i:
+            curr_year = (curr_year or detected_year or 2026) - 1
+        prev_month_i = month_i
+
+        year_to_use = curr_year or detected_year or 2026
+
+        # Parse amount
+        amt_val = float(amount_str.replace('£', '').replace(',', ''))
+        money_in = round(amt_val, 2) if amt_val >= 0 else ''
+        money_out = round(abs(amt_val), 2) if amt_val < 0 else ''
+
+        # Extract description and type: everything before the amount
+        before_amount = line_stripped[:-len(amount_str)].strip()
+        date_prefix = '{} {}'.format(dm.group(1), dm.group(2))  # keep leading zero: '05 Jan'
+        desc_type_part = before_amount[len(date_prefix):].strip()
+
+        # Extract type from end of description
+        tx_type = 'Payment'
+        desc = desc_type_part
+        for kw in type_keywords:
+            idx = desc.rfind(kw)
+            if idx != -1:
+                tx_type = kw
+                desc = desc[:idx].strip()
+                break
+
+        date_str = '{} {} {}'.format(day, month_str, year_to_use)
+
+        transactions.append({
+            'date': date_str,
+            'sort_key': (-year_to_use, -month_i, -day),  # newest first
+            'description': desc,
+            'type': tx_type,
+            'money_in': money_in,
+            'money_out': money_out,
+            'balance': '',
+        })
+
+    # Sort newest first: year DESC, month DESC, day DESC
+    transactions.sort(key=lambda t: t['sort_key'])
+
+    for tx in transactions:
+        tx.pop('sort_key', None)
+
+    return transactions
+
+def parse_natwest_format2_v2(pdf_path):
+    """
+    NatWest Format 2 — pdfplumber grid table parser.
+    Each page has a table: Date | Type | Description | Paid in | Paid out | Balance
+    - Date column can be None (inherits from row above)
+    - Description can contain newlines (merged into one string)
+    - Balance is always present
+    """
+    import re
+    import pdfplumber
+
+    all_rows = []
+    month_idx = {m: i+1 for i, m in enumerate(['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'])}
+
+    with pdfplumber.open(pdf_path) as pdf:
+        all_text = '\n'.join(p.extract_text() or '' for p in pdf.pages)
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            for table in tables:
+                for row in table:
+                    if not row or len(row) < 6:
+                        continue
+                    all_rows.append(row)
+
+    transactions = []
+    prev_date = None
+    detected_year = None
+
+    for line in all_text.split('\n')[:30]:
+        m = re.search(rf'(\d{{1,2}}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{{4}}))', line, re.IGNORECASE)
+        if m:
+            detected_year = int(m.group(2))
+            break
+        hm = re.search(r'(\d{2})/(\d{2})/(\d{4})', line)
+        if hm:
+            detected_year = int(hm.group(3))
+            break
+
+    for row in all_rows:
+        date_val, type_val, desc_val, in_val, out_val, bal_val = row[0], row[1], row[2], row[3], row[4], row[5]
+
+        # Skip header rows
+        if date_val and str(date_val).strip().lower() in ('date', 'none', ''):
+            continue
+        # Skip summary rows
+        if not date_val and (not desc_val or str(desc_val).strip() in ('', 'None')):
+            continue
+        # Skip period/summary rows
+        if desc_val and any(k in str(desc_val) for k in ['Period ', 'Previous Balance', 'Paid out', 'Paid in', 'New Balance']):
+            continue
+
+        # Parse date
+        raw_date_str = str(date_val).strip() if date_val else prev_date
+        if not raw_date_str:
+            continue
+
+        dm = re.match(r'^(\d{1,2})\s+(\w+)\s+(\d{4})', raw_date_str, re.IGNORECASE)
+        if not dm:
+            continue
+        day = int(dm.group(1))
+        month_str = dm.group(2).title()
+        year = int(dm.group(3))
+        month_i = month_idx.get(month_str, 1)
+        date_str = '{} {} {}'.format(day, month_str, year)
+        prev_date = raw_date_str
+
+        # Parse description
+        desc = ' '.join(str(desc_val).split('\n')) if desc_val else ''
+        desc = re.sub(r'\s+', ' ', desc).strip()
+
+        # Parse type
+        tx_type = str(type_val).strip() if type_val else 'Payment'
+        tx_type = ' / '.join(tx_type.split('\n')).strip()
+
+        # Parse amounts
+        def parse_amt(val):
+            if not val or str(val).strip() in ('', 'None'):
+                return None
+            s = str(val).replace('£','').replace(',','').strip()
+            try:
+                return float(s)
+            except:
+                return None
+
+        amt_in = parse_amt(in_val)
+        amt_out = parse_amt(out_val)
+        balance = parse_amt(bal_val)
+
+        if amt_in is not None and amt_in > 0:
+            money_in = round(amt_in, 2)
+            money_out = ''
+            amount = amt_in
+        elif amt_out is not None and amt_out > 0:
+            money_in = ''
+            money_out = round(amt_out, 2)
+            amount = -amt_out
+        else:
+            money_in = ''
+            money_out = ''
+            amount = None
+
+        transactions.append({
+            'date': date_str,
+            'month_idx': month_i,
+            'day': day,
+            'description': desc,
+            'type': tx_type if tx_type else 'Payment',
+            'money_in': money_in,
+            'money_out': money_out,
+            'balance': round(balance, 2) if balance else '',
+            'raw_amount': amount
+        })
+
+    # Fix year rollovers
+    if len(transactions) >= 2:
+        for i in range(1, len(transactions)):
+            if transactions[i]['month_idx'] == 1 and transactions[i-1]['month_idx'] == 12:
+                parts = transactions[i]['date'].split()
+                transactions[i]['date'] = '{} {} {}'.format(parts[0], parts[1], int(parts[2]) + 1)
+
+    transactions.sort(key=lambda t: (t['month_idx'], t['day']))
+    for tx in transactions:
+        tx.pop('month_idx', None)
+        tx.pop('day', None)
+
+    return transactions
 
 def extract_tables_from_pdf(pdf_path):
     """
@@ -491,14 +774,26 @@ def extract_tables_from_pdf(pdf_path):
         all_text = '\n'.join(p.extract_text() or '' for p in pdf.pages)
         tables = [p.extract_tables() for p in pdf.pages]
 
-    # Detect Wise format (Wise Payments Ltd. header + transaction lines without DD Mon on TX line)
+    import re
+    # Detect bank format by characteristic patterns
     is_wise = 'Wise Payments' in all_text or 'wise.com' in all_text.lower()
     is_monzo = 'Monzo' in all_text or 'Account number: 6865' in all_text
+
+    # NatWest Format 2: single-line "DD Mon YYYY £AMOUNT BALANCE" pattern (every TX on one line)
+    is_natwest2 = bool(re.search(r'\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}\s+.*?£[\d,]+\.\d{2}\s+[£]?[\d,]+\.\d{2}', all_text))
+
+    # NatWest Format 3: "DD Mon DESCRIPTION TYPE £-X,XXX.XX" — amount is signed, no balance column
+    # Pattern: signed amount at end: -£2,333.33 or £183.71 (no second amount on same line)
+    is_natwest3 = bool(re.search(r'\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\S+\s+\S+.*?\s+[+-]?£[\d,]+\.\d{2}\s*$', all_text, re.MULTILINE))
 
     if is_wise:
         txns = parse_wise_text(all_text)
     elif is_monzo:
         txns = parse_monzo_text(all_text)
+    elif is_natwest2:
+        txns = parse_natwest_format2_v2(pdf_path)
+    elif is_natwest3:
+        txns = parse_natwest_format3(pdf_path)
     else:
         txns = parse_bank_text(all_text)
 
